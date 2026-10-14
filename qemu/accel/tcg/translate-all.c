@@ -988,14 +988,40 @@ static inline void *alloc_code_gen_buffer(struct uc_struct *uc)
     memcpy(data + 0xC, (void*)&handler, 4);
 #endif
 
-    uc->seh_handle = AddVectoredExceptionHandler(0, (PVECTORED_EXCEPTION_HANDLER)closure);
-    if (!uc->seh_handle) {
+    // Reserve the large executable buffer
+    void *buf = VirtualAlloc(NULL, size, MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!buf) {
+        // cleanup handler/closure on failure
+        RemoveVectoredExceptionHandler(uc->seh_handle);
         VirtualFree(uc->seh_closure, 0, MEM_RELEASE);
         uc->seh_closure = NULL;
+        uc->seh_handle = NULL;
         return NULL;
     }
 
-    return VirtualAlloc(NULL, size, MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    // Commit an initial working window to avoid relying solely on SEH.
+    // Commit up to COMMIT_COUNT pages (or the whole buffer if smaller).
+    size_t page = uc->qemu_real_host_page_size ? uc->qemu_real_host_page_size : 4096;
+    size_t commit_size = (size_t)COMMIT_COUNT * page;
+    if (commit_size > size) commit_size = size;
+
+    // VirtualAlloc requires page-aligned base; buf is page aligned from VirtualAlloc(NULL,...)
+    if (!VirtualAlloc(buf, commit_size, MEM_COMMIT, PAGE_EXECUTE_READWRITE)) {
+        // If commit fails, free reserved region and cleanup
+        VirtualFree(buf, 0, MEM_RELEASE);
+        RemoveVectoredExceptionHandler(uc->seh_handle);
+        VirtualFree(uc->seh_closure, 0, MEM_RELEASE);
+        uc->seh_closure = NULL;
+        uc->seh_handle = NULL;
+        
+        return NULL;
+    }
+
+    tcg_ctx->code_gen_buffer = buf;
+    tcg_ctx->initial_buffer = tcg_ctx->code_gen_buffer;
+    tcg_ctx->initial_buffer_size = tcg_ctx->code_gen_buffer_size;
+
+    return buf;
 }
 void free_code_gen_buffer(struct uc_struct *uc)
 {
